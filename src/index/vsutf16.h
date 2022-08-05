@@ -35,12 +35,4 @@ static std::string utf16_to_utf8(const std::wstring &wstr) {
     return buffer;
 }
 
-static std::wstring utf16_from_utf8(const std::string &str) {
-    int required_size = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, nullptr, 0);
-    std::wstring wbuffer;
-    wbuffer.resize(required_size - 1);
-    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), &wbuffer[0], required_size);
-    return wbuffer;
-}
-
 #endif

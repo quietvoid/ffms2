@@ -48,7 +48,6 @@ private:
     int Delay = 0;
     int DelayCounter = 0;
     int InitialDecode = 1;
-    bool PAFFAdjusted = false;
 
     int LastFrameHeight = -1;
     int LastFrameWidth = -1;
@@ -89,7 +88,6 @@ private:
     AVFrame *DecodeFrame = nullptr;
     AVFrame *LastDecodedFrame = nullptr;
     int LastFrameNum = 0;
-    FFMS_Index &Index;
     FFMS_Track Frames;
     int VideoTrack;
     int CurrentFrame = 1;

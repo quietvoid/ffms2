@@ -175,7 +175,7 @@ FFMS_Frame *FFMS_VideoSource::OutputFrame(AVFrame *Frame) {
 }
 
 FFMS_VideoSource::FFMS_VideoSource(const char *SourceFile, FFMS_Index &Index, int Track, int Threads, int SeekMode)
-    : Index(Index), SeekMode(SeekMode) {
+    : SeekMode(SeekMode) {
 
     try {
         if (Track < 0 || Track >= static_cast<int>(Index.size()))
@@ -197,10 +197,7 @@ FFMS_VideoSource::FFMS_VideoSource(const char *SourceFile, FFMS_Index &Index, in
         Frames = Index[Track];
         VideoTrack = Track;
 
-        if (Threads < 1)
-            DecodingThreads = (std::min)(std::thread::hardware_concurrency(), 16u);
-        else
-            DecodingThreads = Threads;
+        DecodingThreads = (Threads < 1) ? std::thread::hardware_concurrency() : Threads;
 
         DecodeFrame = av_frame_alloc();
         LastDecodedFrame = av_frame_alloc();
@@ -210,7 +207,7 @@ FFMS_VideoSource::FFMS_VideoSource(const char *SourceFile, FFMS_Index &Index, in
                 "Could not allocate dummy frame.");
 
         // Dummy allocations so the unallocated case doesn't have to be handled later
-        if (av_image_alloc(SWSFrameData, SWSFrameLinesize, 16, 16, AV_PIX_FMT_GRAY8, 4) < 0)
+        if (av_image_alloc(SWSFrameData, SWSFrameLinesize, 16, 16, AV_PIX_FMT_GRAY8, 64) < 0)
             throw FFMS_Exception(FFMS_ERROR_DECODING, FFMS_ERROR_ALLOCATION_FAILED,
                 "Could not allocate dummy frame.");
 
@@ -228,25 +225,25 @@ FFMS_VideoSource::FFMS_VideoSource(const char *SourceFile, FFMS_Index &Index, in
         if (avcodec_parameters_to_context(CodecContext, FormatContext->streams[VideoTrack]->codecpar) < 0)
             throw FFMS_Exception(FFMS_ERROR_DECODING, FFMS_ERROR_CODEC,
                 "Could not copy video decoder parameters.");
-        CodecContext->thread_count = DecodingThreads;
+
+        CodecContext->thread_count = (CodecContext->codec_id == AV_CODEC_ID_VP9) ? std::min(DecodingThreads, 8) : DecodingThreads;
         CodecContext->has_b_frames = Frames.MaxBFrames;
 
-        // Full explanation by more clever person availale here: https://github.com/Nevcairiel/LAVFilters/issues/113
-        if (CodecContext->codec_id == AV_CODEC_ID_H264 && CodecContext->has_b_frames)
-            CodecContext->has_b_frames = 15; // the maximum possible value for h264
+        if (CodecContext->codec_id == AV_CODEC_ID_AV1)
+        {
+            int threads = DecodingThreads == 1 ? 1 : 2;
+            av_opt_set_int(CodecContext->priv_data, "tilethreads", threads, 0);
+            av_opt_set_int(CodecContext->priv_data, "framethreads", threads, 0);
+            Delay = CodecContext->thread_count;
+        }
+        else if (CodecContext->codec_id == AV_CODEC_ID_MPEG2VIDEO)
+            Delay = CodecContext->has_b_frames;
+        else
+            Delay = CodecContext->has_b_frames + CodecContext->thread_count - 1;
 
         if (avcodec_open2(CodecContext, Codec, nullptr) < 0)
             throw FFMS_Exception(FFMS_ERROR_DECODING, FFMS_ERROR_CODEC,
                 "Could not open video codec");
-
-        // Similar yet different to h264 workaround above
-        // vc1 simply sets has_b_frames to 1 no matter how many there are so instead we set it to the max value
-        // in order to not confuse our own delay guesses later
-        // Doesn't affect actual vc1 reordering unlike h264
-        if (CodecContext->codec_id == AV_CODEC_ID_VC1 && CodecContext->has_b_frames)
-            Delay = 7 + (CodecContext->thread_count - 1); // the maximum possible value for vc1
-        else
-            Delay = CodecContext->has_b_frames + (CodecContext->thread_count - 1); // Normal decoder delay
 
         // Always try to decode a frame to make sure all required parameters are known
         int64_t DummyPTS = 0, DummyPos = 0;
@@ -640,29 +637,28 @@ bool FFMS_VideoSource::DecodePacket(AVPacket *Packet) {
     int Ret = avcodec_receive_frame(CodecContext, DecodeFrame);
     if (Ret != 0) {
         std::swap(DecodeFrame, LastDecodedFrame);
-        if (!(Packet->flags & AV_PKT_FLAG_DISCARD))
-            DelayCounter++;
-    } else if (!!(Packet->flags & AV_PKT_FLAG_DISCARD)) {
-        // If sending discarded frame when the decode buffer is not empty, caller
-        // may still obtained bufferred decoded frames and the number of frames
-        // in the buffer decreases.
-        DelayCounter--;
-    }
+		DelayCounter++;
+    } else if ((CodecContext->codec_id == AV_CODEC_ID_VP9 ||
+                CodecContext->codec_id == AV_CODEC_ID_AV1) && Ret != AVERROR(EAGAIN) && Ret != AVERROR_EOF) {
+        // The internal VP9 BSF does not follow the push/pull documentation properly.
+        // It should keep a queue of data interanlly so further calls can return EAGAIN,
+        // but with VP9, it frees and discards that data when the next packet is sent.
+        // We need to call it a maximum of one extra time, to account for super frames
+        // that have both a visible and invisible frame in one packet. If we don't,
+        // the API happily and silently creates corrupt data output. There are not even
+        // any warnings output by the decoder. Happy days.
+        AVFrame *tmp = av_frame_alloc();
+        int VP9Ret = 0;
+        if (!tmp)
+            throw FFMS_Exception(FFMS_ERROR_DECODING, FFMS_ERROR_ALLOCATION_FAILED, "Could not alloacate temp frame.");
+        while (VP9Ret == 0)
+            VP9Ret = avcodec_receive_frame(CodecContext, tmp);
+        av_frame_free(&tmp);
+	}
 
     if (Ret == 0 && InitialDecode == 1)
         InitialDecode = -1;
 
-    // H.264 (PAFF) and HEVC can have one field per packet, and decoding delay needs
-    // to be adjusted accordingly.
-    if (CodecContext->codec_id == AV_CODEC_ID_H264 || CodecContext->codec_id == AV_CODEC_ID_HEVC) {
-        if (LastDecodedFrame->interlaced_frame == 1)
-            HaveSeenInterlacedFrame = true;
-        if (!PAFFAdjusted && DelayCounter > Delay && HaveSeenInterlacedFrame && LastDecodedFrame->repeat_pict == 0 && Ret != 0) {
-            int OldBFrameDelay = Delay - (CodecContext->thread_count - 1);
-            Delay = 1 + OldBFrameDelay * 2 + (CodecContext->thread_count - 1);
-            PAFFAdjusted = true;
-        }
-    }
 
     return (Ret == 0) || (DelayCounter > Delay && !InitialDecode);;
 }
@@ -808,10 +804,11 @@ FFMS_Frame *FFMS_VideoSource::GetFrame(int n) {
             Seek = false;
         }
 
+		if (CurrentFrame + Delay * CodecContext->ticks_per_frame >= n)
+			CodecContext->skip_frame = AVDISCARD_DEFAULT;
+
         int64_t StartTime = AV_NOPTS_VALUE, FilePos = -1;
-        bool Hidden = (((unsigned) CurrentFrame < Frames.size()) && Frames[CurrentFrame].Hidden);
-        if (HasSeeked || !Hidden || PAFFAdjusted)
-            DecodeNextFrame(StartTime, FilePos);
+        DecodeNextFrame(StartTime, FilePos);
 
         if (!HasSeeked)
             continue;

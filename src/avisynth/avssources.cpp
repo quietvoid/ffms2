@@ -640,6 +640,10 @@ PVideoFrame AvisynthVideoSource::GetFrame(int n, IScriptEnvironment *Env) {
             Env->propSetFloat(props, "ContentLightLevelMax", Frame->ContentLightLevelMax, 0);
             Env->propSetFloat(props, "ContentLightLevelAverage", Frame->ContentLightLevelAverage, 0);
         }
+
+        if (Frame->DolbyVisionRPU && Frame->DolbyVisionRPUSize) {
+            Env->propSetData(props, "DolbyVisionRPU", (const char*)Frame->DolbyVisionRPU, Frame->DolbyVisionRPUSize, 0);
+        }
     }
 
     return Dst;
